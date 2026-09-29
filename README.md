@@ -1,61 +1,197 @@
-# AI-Based Routing Congestion Prediction — Project Skeleton
+# AI-Based Routing Congestion Prediction for VLSI Chip Design
 
-## Libraries used
+Predicting wire-routing congestion on a computer chip **before** the expensive
+routing step is run, using a U-Net deep learning model trained on chip
+placement data.
 
-| Purpose                          | Library                              |
-|-----------------------------------|---------------------------------------|
-| Chip placement & routing          | OpenROAD (via Docker, controlled with Tcl scripts) |
-| Numeric arrays / grid building    | NumPy                                |
-| Reading/writing tabular reports   | Pandas                               |
-| Deep learning model (U-Net)       | PyTorch                              |
-| Evaluation (SSIM)                 | scikit-image                         |
-| Plotting heatmaps                 | Matplotlib                           |
-| Progress bars                     | tqdm                                 |
+---
 
-## Pipeline (matches your 6-step plan)
+## 1. What this project does
 
-1. `tcl_scripts/extract_placement.tcl` — runs INSIDE the OpenROAD docker.
-   Loads a design, runs placement, dumps every cell's position and every
-   pin's position to CSV files.
+Chip design has two major physical steps:
+1. **Placement** — deciding where every logic gate sits on the chip
+2. **Routing** — connecting all those gates with wires
 
-2. `tcl_scripts/global_route_congestion.tcl` — runs INSIDE OpenROAD.
-   Runs global routing on the placed design and dumps a congestion report
-   (per-gcell overflow) to CSV. This is your "ground truth".
+Routing is slow and can fail if too many wires try to squeeze through a small
+area (this is called **congestion**). This project trains a neural network to
+**predict where congestion will happen, using only placement data** — i.e.
+before routing is ever run. This lets chip designers catch problems early and
+save huge amounts of design time.
 
-3. `src/feature_engineering.py` — runs OUTSIDE docker, plain Python.
-   Reads the placement CSVs, bins everything into a grid (e.g. 256x256),
-   and computes 3 channels: cell density, pin density, RUDY.
-   Saves as a `.npy` file (input X).
+---
 
-4. `src/heatmap_generation.py` — plain Python.
-   Reads the congestion CSV, bins it onto the SAME grid, saves as `.npy`
-   (target Y).
+## 2. Project structure
 
-5. `src/dataset.py` — PyTorch Dataset that loads (X, Y) pairs.
-
-6. `src/model.py` — U-Net architecture definition.
-
-7. `src/train.py` — training loop (80/20 split, saves checkpoints).
-
-8. `src/evaluate.py` — loads a trained model, predicts on the test set,
-   computes MSE and SSIM, and plots predicted vs real heatmaps.
-
-## How you'd actually run it
-
-```bash
-# Inside the OpenROAD docker container:
-openroad tcl_scripts/extract_placement.tcl
-openroad tcl_scripts/global_route_congestion.tcl
-
-# Outside docker, in your normal Python env:
-pip install -r requirements.txt
-python src/feature_engineering.py
-python src/heatmap_generation.py
-python src/train.py
-python src/evaluate.py
+```
+vlsi_congestion_project/
+├── README.md
+├── requirements.txt
+├── .gitignore
+├── tcl_scripts/
+│   ├── extract_placement.tcl        # runs INSIDE OpenROAD
+│   └── global_route_congestion.tcl  # runs INSIDE OpenROAD
+├── src/
+│   ├── feature_engineering.py       # builds model INPUT (X)
+│   ├── heatmap_generation.py        # builds model TARGET (Y)
+│   ├── make_dummy_data.py           # generates fake data for testing
+│   ├── dataset.py                   # PyTorch Dataset
+│   ├── model.py                     # U-Net architecture
+│   ├── train.py                     # training loop
+│   └── evaluate.py                  # testing + metrics
+├── data/
+│   ├── raw/                         # CSVs from OpenROAD go here
+│   └── processed/                   # .npy files (model-ready) go here
+└── checkpoints/                     # trained model + test outputs saved here
 ```
 
-Note: the Tcl scripts assume you already have a design (e.g. OpenROAD's
-built-in `gcd` or `ibex` example, or an ISPD 2011 benchmark) loaded the
-same way OpenROAD's own flow scripts do. You will need to adjust file
-paths (`.def`, `.lef`) to match whichever design you use.
+---
+
+## 3. How the model "sees" the chip — and how training data is prepared
+
+The model doesn't read raw chip files directly. Chip layouts get converted
+into an **image-like format** first, because the model is a U-Net — an
+architecture built for image-to-image tasks (originally used for spotting
+tumors in medical scans; here it spots congestion instead).
+
+### The input (X) — 3-channel image, shape `(3, 256, 256)`
+Every chip design is laid over a 256×256 grid, like graph paper. For every
+grid square, three values are calculated and stacked like RGB channels of a
+photo:
+
+| Channel | What it measures |
+|---|---|
+| 0 | **Cell density** — how many logic gates are packed into that square |
+| 1 | **Pin density** — how many connection points are in that square |
+| 2 | **RUDY** — an estimate of how many wires are *likely* to pass through |
+
+This is produced by `src/feature_engineering.py`, which reads
+`cell_positions.csv` / `pin_positions.csv` (generated by
+`extract_placement.tcl` inside OpenROAD) and saves a `.npy` file.
+
+### The target (Y) — 1-channel image, shape `(1, 256, 256)`
+The same grid, but each square holds the **real congestion value** (how
+overcrowded that area got once wires were actually routed). This is the
+"correct answer" the model is trained to reproduce.
+
+This is produced by `src/heatmap_generation.py`, which reads
+`congestion_report.csv` (generated by `global_route_congestion.tcl` inside
+OpenROAD) and saves a `.npy` file.
+
+### How pairs get matched up
+Every chip design produces **one input file + one target file**, named so
+`dataset.py` can automatically pair them:
+
+```
+data/processed/
+├── design1_input.npy
+├── design1_target.npy
+├── design2_input.npy
+├── design2_target.npy
+...
+```
+
+`dataset.py` scans this folder, finds every `*_input.npy`, and looks for a
+matching `*_target.npy` — so you can add as many chip designs as you want,
+just by dropping more matching-named `.npy` pairs into `data/processed/`.
+
+**No manual labeling is needed** — the "labels" (target heatmaps) are
+generated automatically by OpenROAD's own routing report, not hand-annotated.
+
+---
+
+## 4. How someone trains the model — step by step
+
+### Step 1 — Set up the environment
+```powershell
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Step 2 — Get chip designs
+Use OpenROAD's small built-in example designs first (e.g. `gcd`, `ibex`) to
+get the pipeline working, then move to real benchmark suites (ISPD 2011,
+DAC 2012) for more serious results.
+
+### Step 3 — Generate raw placement + congestion data (inside OpenROAD/Docker)
+```bash
+openroad tcl_scripts/extract_placement.tcl
+openroad tcl_scripts/global_route_congestion.tcl
+```
+This produces the CSVs in `data/raw/`.
+
+### Step 4 — Convert raw data into model-ready `.npy` files
+```powershell
+python src\feature_engineering.py
+python src\heatmap_generation.py
+```
+Repeat Steps 3–4 for every chip design you want to include, giving each pair
+a unique name (`design1_`, `design2_`, etc.) so none get overwritten.
+
+*(Don't have OpenROAD set up yet? Run `python src\make_dummy_data.py`
+instead to generate random placeholder data, just to confirm the training
+code itself runs correctly.)*
+
+### Step 5 — Train
+```powershell
+python src\train.py
+```
+This automatically splits your designs 80% training / 20% testing, trains
+for 50 epochs, and saves the trained model to
+`checkpoints/unet_congestion.pth`.
+
+### Step 6 — Evaluate
+```powershell
+python src\evaluate.py
+```
+Runs the trained model on the held-out 20% of designs, scores predictions
+against the real congestion maps using **MSE** and **SSIM**, and saves
+side-by-side comparison images to `checkpoints/`.
+
+---
+
+## 5. What "training" actually looks like under the hood
+
+For each chip design in the training set:
+1. The model is shown the 3-channel placement image
+2. It guesses a congestion heatmap
+3. That guess is compared to the real heatmap (MSE loss)
+4. The model's internal weights are nudged slightly to reduce that error
+5. This repeats for every design, every epoch (50 times through the full
+   dataset by default), gradually improving predictions
+
+---
+
+## 6. Next steps / what's left to do
+
+- [ ] Install Docker + pull the OpenROAD image
+- [ ] Run the two `.tcl` scripts on a small test design (`gcd`) to confirm
+      the whole CSV → `.npy` → training pipeline works on real data
+- [ ] Download and process a batch of ISPD 2011 / DAC 2012 benchmark
+      designs to build a real training set (aim for a reasonable number of
+      designs — more designs = better generalization)
+- [ ] Train the full model and tune hyperparameters (epochs, learning rate,
+      batch size) in `src/train.py` if results are poor
+- [ ] Evaluate on held-out designs, report MSE/SSIM in the final report
+- [ ] (Optional, for a stronger final-year report) Compare against a
+      simpler baseline (e.g. just using RUDY channel alone) to show the
+      full model adds real value
+
+---
+
+## 7. Requirements
+
+```
+numpy
+pandas
+torch
+torchvision
+scikit-image
+matplotlib
+tqdm
+```
+
+Install via:
+```powershell
+pip install -r requirements.txt
+```
